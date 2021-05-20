@@ -1,0 +1,89 @@
+#!/usr/bin/env python3
+
+import argparse
+import time
+from functools import partial
+
+from opensfm import dataset
+from opensfm import config
+from opensfm import pairs_selection
+
+import matplotlib.pyplot as plt
+from matplotlib.widgets import Slider
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description='Plot inlier and outlier matches between images')
+    parser.add_argument('dataset',
+                        help='path to the data set to be processed')
+    args = parser.parse_args()
+    data = dataset.DataSet(args.dataset)
+
+    all_images = data.images()
+    exifs = {im: data.load_exif(im) for im in all_images}
+
+    options = {}
+    for option in [x for x in data.config.keys() if x.find('matching') >= 0]:
+        if 'threshold' in option or 'depthmap' in option or 'robust' in option or 'use' in option or 'other' in option:
+            continue
+        if 'neighbors' in option:
+            options[option] = {'type': int}
+        elif 'distance' in option:
+            options[option] = {'type': float}
+        else:
+            options[option] = {'type': bool}
+
+    fig, ax = plt.subplots()
+
+    slider_height = 0.02
+    plt.subplots_adjust(left=0.15, bottom=0.1+slider_height*len(options))
+
+
+    print("INIT ...")
+    start = time.time()
+    _, _ = pairs_selection.match_candidates_from_metadata(
+        all_images, all_images, exifs, data)
+    end = time.time()
+    print("INITED IN ", end-start)
+
+
+
+    def update():
+        ax.clear()
+        for image in all_images:
+            gps = exifs[image]["gps"]
+            lat, lon = gps["latitude"], gps["longitude"]
+            ax.plot(
+                    lat,
+                    lon,
+                    linestyle="",
+                    marker="o",
+                    linewidth=1,
+                    color='red',
+                )
+
+        pairs, _ = pairs_selection.match_candidates_from_metadata(all_images, all_images, exifs, data)
+        for im1, im2 in pairs:
+            gps1 = exifs[im1]["gps"]
+            lat1, lon1 = gps1["latitude"], gps1["longitude"]
+            gps2 = exifs[im2]["gps"]
+            lat2, lon2 = gps2["latitude"], gps2["longitude"]
+            ax.plot([lat1, lat2], [lon1, lon2], linestyle="-", color='green')
+        fig.canvas.draw_idle()
+        return False
+
+    def set_config(name, value):
+        data.config[name] = value
+        update()
+
+    max_val = max([float(data.config[x]) for x in options])
+    sliders = []
+    for i, (name, t) in enumerate(options.items()):
+        a_num = plt.axes([0.15, (i+1)*slider_height*1.1, 0.7, slider_height])
+        s_num = Slider(a_num, name, 0, max_val, valinit=data.config[name], valstep=1)
+        bound_set_config = partial(set_config, name)
+        s_num.on_changed(bound_set_config)
+        sliders.append(s_num)
+
+    update()
+    plt.show()
