@@ -1,0 +1,114 @@
+import argparse
+import logging
+import os
+import time
+from calendar import timegm
+
+from opensfm import dataset
+from opensfm import geo
+from opensfm import io
+
+
+logger = logging.getLogger(__name__)
+
+
+def store_features(features, filename):
+    geojson = {
+        "type": "FeatureCollection",
+        "features": features,
+    }
+    with io.open_wt(filename) as fp:
+        io.json_dump(geojson, fp)
+
+
+def get_lla(files_attributes):
+    lat_attr = 'Latitude'
+    lon_attr = 'Longitude'
+    alt_attr = 'Altitude'
+    all_attr = [lat_attr, lon_attr, alt_attr]
+
+    llas = {}
+    for name, attr in files_attributes.items():
+        llas[name] = {
+                'latitude': float(attr[lat_attr]),
+                'longitude': float(attr[lon_attr]),
+                'altitude': float(attr[alt_attr]),
+        }
+    return llas
+
+def get_lla_centered(files_attributes):
+    ref_lat_attr = 'TCCCentreLat'
+    ref_lon_attr = 'TCCCentreLon'
+    x_attr = 'TCCX'
+    y_attr = 'TCCY'
+    z_attr = 'TCCZ'
+    all_attr = [ref_lat_attr, ref_lon_attr, x_attr, y_attr, z_attr]
+
+    llas = {}
+    for name, attr in files_attributes.items():
+        conv = geo.TopocentricConverter(float(attr[ref_lat_attr]), float(attr[ref_lon_attr]), 0.)
+        lat, lon, alt = conv.to_lla(float(attr[x_attr]), float(attr[y_attr]), float(attr[z_attr]))
+        llas[name] = {
+                'latitude': lat,
+                'longitude': lon,
+                'altitude': alt,
+        }
+    return llas
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description='Create GeoJSON of lat/lon/alt of images from a ZZZ dataset')
+    parser.add_argument('folder', help='path to the folder containing the ZZZ images')
+    args = parser.parse_args()
+    logger.info(f'Creating GeoJSON of {args.folder}')
+
+    data = dataset.DataSet(args.folder)
+    images = data.images()
+
+    name_attr = 'PhotoName'
+    camera_attr = 'CameraName'
+
+    # Read CSV file
+    files_attributes = {}
+    with open(os.path.join(args.folder, 'Photos.csv'), 'r') as f:
+        lines = f.readlines()
+
+        # Set columns name
+        columns = []
+        for name in lines[0].split(','):
+            columns.append(name.strip())
+
+        # Read files
+        for line in lines[1:]:
+            file_attributes = {}
+            for i, data in  enumerate(line.split(',')):
+                file_attributes[columns[i]] = data.strip('"')
+            files_attributes[file_attributes[name_attr]] = file_attributes
+
+    # Get lat/lon/alt
+    llas = get_lla_centered(files_attributes)
+
+    # From LLA to GeoJSON
+    gps_features = []
+    for name, lla in llas.items():
+
+        gps_features.append({
+                    "type": "Feature",
+                    "geometry": {
+                        "type": "Point",
+                        "coordinates": [lla['longitude'],
+                                        lla['latitude']],
+                    },
+                    "properties": {
+                        "name": name,
+                        "marker-size": "small",
+                        "marker-color": "#E80",
+                    }
+                })
+
+    store_features(gps_features, args.folder + '/reconstruction.gps.geojson')
+
+
+if __name__ == '__main__':
+    main()

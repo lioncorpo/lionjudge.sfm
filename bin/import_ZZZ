@@ -1,0 +1,127 @@
+import argparse
+import logging
+import os
+import time
+from calendar import timegm
+
+from opensfm import dataset
+from opensfm import io
+
+
+logger = logging.getLogger(__name__)
+
+
+def write_camera_models(folder, files_attributes):
+    model_attr = 'CameraName'
+    cx_attr = 'PPU'
+    cy_attr = 'PPV'
+    focal_attr = 'FocalLengthXMM'
+    width_attr = 'ImageWidth'
+    height_attr = 'ImageHeight'
+    pixel_size_attr = 'PixelSizeUM'
+    all_attr = [model_attr, cx_attr, cy_attr, focal_attr, width_attr, height_attr, pixel_size_attr]
+
+    camera_models = {}
+    for attr in files_attributes.values():
+        camera_models[attr[model_attr]] = {
+            k: attr[k] for k in all_attr
+        }
+
+    camera_models_json = {}
+    for name, attr in camera_models.items():
+        projection_type = 'brown'
+
+        width_mm = int(attr[width_attr])*float(attr[pixel_size_attr])/1000
+        height_mm = int(attr[height_attr])*float(attr[pixel_size_attr])/1000
+        normalizer_mm = max(width_mm, height_mm)
+
+        focal_ratio = float(attr[focal_attr])/normalizer_mm
+
+        normalizer = max(int(attr[width_attr]), int(attr[height_attr]))
+        cx = (float(attr[cx_attr])-int(attr[width_attr])/2)/normalizer
+        cy = (float(attr[cy_attr])-int(attr[height_attr])/2)/normalizer
+
+        camera_models_json[name] = {
+            'focal_x_prior': focal_ratio,
+            'focal_y_prior': focal_ratio,
+            'cx_prior': cx,
+            'cy_prior': cy,
+            'width': attr[width_attr],
+            'projection_type': projection_type,
+            'focal_x': focal_ratio,
+            'focal_y': focal_ratio,
+            'cx': cx,
+            'cy': cy,
+            'height': attr[height_attr]
+        }
+
+    with io.open_wt(os.path.join(folder, 'camera_models_overrides.json')) as fout:
+        io.json_dump(camera_models_json, fout, False)
+
+def write_exifs(folder, files_attributes):
+    model_attr = 'CameraName'
+    lat_attr = 'Latitude'
+    lon_attr = 'Longitude'
+    alt_attr = 'Altitude'
+    time_attr = 'UTCTime'
+    all_attr = [model_attr, lat_attr, lon_attr, alt_attr, time_attr]
+
+    dop = 0.1
+
+    exifs_overrides = {}
+    for name, attr in files_attributes.items():
+        utc_time = time.strptime(attr[time_attr], "%Y-%m-%dT%H:%M:%SZ")
+        time_since_epoch = timegm(utc_time)
+        exifs_overrides[name] = {
+            'capture_time': time_since_epoch,
+            'camera': attr[model_attr],
+            'gps':{
+                'latitude': float(attr[lat_attr]),
+                'longitude': float(attr[lon_attr]),
+                'altitude': float(attr[alt_attr]),
+                'dop': dop
+            }
+        }
+
+    with io.open_wt(os.path.join(folder, 'exif_overrides.json')) as fout:
+        io.json_dump(exifs_overrides, fout, False)
+
+def main():
+    parser = argparse.ArgumentParser(
+        description='Create EXIFs and image list file frowm a ZZZ dataset')
+    parser.add_argument('folder', help='path to the folder containing the ZZZ images')
+    args = parser.parse_args()
+    logger.info(f'Creating EXIF and list files of {args.folder}')
+
+    data = dataset.DataSet(args.folder)
+
+    # Create image_list.txt
+    with open(os.path.join(args.folder, 'image_list.txt'), 'w') as f:
+        for image in data.images():
+            f.write('images/' + image + '\n')
+    data._load_image_list()
+
+    # Read CSV file
+    files_attributes = {}
+    with open(os.path.join(args.folder, 'Photos.csv'), 'r') as f:
+        lines = f.readlines()
+
+        # Set columns name
+        columns = []
+        for name in lines[0].split(','):
+            columns.append(name.strip())
+
+        # Read files
+        name_attr = 'PhotoName'
+        for line in lines[1:]:
+            file_attributes = {}
+            for i, data in  enumerate(line.split(',')):
+                file_attributes[columns[i]] = data.strip('"')
+            files_attributes[file_attributes[name_attr]] = file_attributes
+
+    write_camera_models(args.folder, files_attributes)
+    write_exifs(args.folder, files_attributes)
+
+
+if __name__ == '__main__':
+    main()
