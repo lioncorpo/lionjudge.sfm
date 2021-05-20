@@ -1,0 +1,12 @@
+sudo: required
+
+language: python
+
+services:
+  - docker
+
+before_install:
+  - docker build -t mapillary/opensfm .
+
+script:
+  - docker run mapillary/opensfm /bin/sh -c "cd /source/OpenSfM; py.test"
