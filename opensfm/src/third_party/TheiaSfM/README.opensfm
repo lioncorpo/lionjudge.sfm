@@ -1,0 +1,7 @@
+Project: TheiaSfM
+URL: https://github.com/sweeneychris/TheiaSfM
+License: BSD
+Version: f6619ce4950a8b049e5a2c2c8b2dc996e24478a1,  2019-04-30
+Local modifications:
+
+* Imported only cascade hashing feature matcher and dependent files

@@ -1,0 +1,320 @@
+#!/usr/bin/env python
+
+import argparse
+import datetime
+import logging
+import os.path
+import shutil
+import yaml
+import math
+
+from itertools import combinations
+from timeit import default_timer as timer
+
+from opensfm import bow
+from opensfm import commands
+from opensfm import csfm
+from opensfm import dataset
+from opensfm import features
+from opensfm import feature_loader
+from opensfm import io
+from opensfm import log
+from opensfm import matching
+
+
+logger = logging.getLogger(__name__)
+log.setup()
+
+
+def create_bench_dir(dataset):
+    base_dir = os.path.dirname(os.path.normpath(dataset)) if \
+        os.path.isdir(dataset) else \
+        os.path.dirname(dataset)
+
+    dataset_dir = os.path.basename(os.path.normpath(dataset))
+
+    bench_dir = os.path.join(
+        base_dir,
+        dataset_dir + \
+        "__bench_feat_match__" + \
+        datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S"))
+
+    io.mkdir_p(bench_dir)
+
+    return bench_dir
+
+
+def create_dataset(orig_dir, bench_dir, config):
+    if config["matcher_type"] in ["FLANN", "CASCADE_HASHING", "MATRIX", "BRUTE_FORCE"]:
+        return create_named_dataset(config["matcher_type"].lower(), orig_dir, bench_dir, config)
+    elif "WORDS" in config["matcher_type"]:
+        return create_words_dataset(orig_dir, bench_dir, config)
+    else:
+        raise ValueError("Invalid matcher_type: {}".format(
+            config["matcher_type"]))
+
+
+def overwrite_config(config, work_dir):
+    orig_config = load_config(work_dir)
+
+    for key, value in config.items():
+        orig_config[key] = value
+
+    save_config(orig_config, work_dir)
+
+
+def create_named_dataset(name, orig_dir, bench_dir, config):
+    work_dir = os.path.join(bench_dir, name)
+    shutil.copytree(orig_dir, work_dir)
+
+    overwrite_config(config, work_dir)
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument('dataset')
+    args = parser.parse_args([work_dir])
+
+    return dataset.DataSet(args.dataset)
+
+
+def create_words_dataset(orig_dir, bench_dir, config):
+    data = create_named_dataset("words", orig_dir, bench_dir, config)
+
+    for image in data.images():
+        bows = bow.load_bows(data.config)
+        n_closest = data.config['bow_words_to_match']
+        p, f, c = data.load_features(image)
+        closest_words = bows.map_to_words(
+            f, n_closest, data.config['bow_matcher_type'])
+        data.save_words(image, closest_words)
+
+    return data
+
+
+def load_config(work_dir):
+    config = {}
+    filepath = os.path.join(work_dir, "config.yaml")
+    if os.path.isfile(filepath):
+        with open(filepath) as fin:
+            new_config = yaml.safe_load(fin)
+        if new_config:
+            for k, v in new_config.items():
+                config[k] = v
+
+    return config
+
+
+def save_config(config, work_dir):
+    with open(os.path.join(work_dir, 'config.yaml'), 'w') as fout:
+        yaml.dump(config, fout, default_flow_style=False)
+
+
+def match(data):
+    images = data.images()
+    images.sort()
+
+    pairs = list(combinations(images, 2))
+    comb = {im: [] for im in images}
+    for im1, im2 in pairs:
+        comb[im1].append(im2)
+
+    matching_time = []
+
+    ctx = matching.Context()
+    ctx.data = data
+    ctx.cameras = ctx.data.load_camera_models()
+    ctx.exifs = {im: data.load_exif(im) for im in data.images()}
+    ctx.overwrite = False
+
+    for im1 in comb:
+        t = timer()
+        matching.match_unwrap_args((im1, comb[im1], ctx))
+        matching_time.append(timer() - t)
+
+    mean_time = sum(matching_time) / len(matching_time)
+    mean_time_pair = sum(matching_time) / len(pairs)
+
+    logger.debug("Average matching time ({}): {} per image, {} per pair".format(
+        data.config["matcher_type"],
+        mean_time, mean_time_pair))
+
+    return mean_time, mean_time_pair
+
+
+def load_matches(data):
+    matches = {}
+    for im1 in data.images():
+        m = data.load_matches(im1, "initial_matches.pkl.gz")
+        for im2 in m:
+            matches[tuple(sorted([im1, im2]))] = m[im2]
+
+    return matches
+
+
+def benchmark_matches(matches, truth):
+    res = {
+        "true_pos": [],
+        "false_pos": [],
+        "false_neg": [],
+    }
+
+    for pair in truth:
+        if pair not in matches:
+            res["false_neg"] = truth[pair]
+            continue
+
+        m = matches[pair]
+        for match in truth[pair]:
+            if match in m:
+                res["true_pos"].append(match)
+            else:
+                res["false_neg"].append(match)
+
+    for pair in matches:
+        if pair not in truth:
+            res["false_pos"] = matches[pair]
+            continue
+
+        t = truth[pair]
+        for match in matches[pair]:
+            if match not in t:
+                res["false_pos"].append(match)
+
+    return res
+
+
+def match_and_report(data, bench_matches):
+    matching_time, matching_time_pair = match(data)
+    matches = load_matches(data)
+    bench_res = benchmark_matches(matches, bench_matches)
+    report(bench_res, data.config["matcher_type"])
+
+    precision, recall = precision_recall(bench_res)
+
+    return matching_time, matching_time_pair, precision, recall
+
+
+def precision_recall(bench_res):
+    true_pos = len(bench_res["true_pos"])
+    false_pos = len(bench_res["false_pos"])
+    false_neg = len(bench_res["false_neg"])
+
+    precision = 0 if true_pos == 0 else float(true_pos) / (true_pos + false_pos)
+    recall = 0 if true_pos == 0 else float(true_pos) / (true_pos + false_neg)
+
+    return precision, recall
+
+
+def merge_dicts(x, y):
+    z = x.copy()
+    z.update(y)
+    return z
+
+
+def report(res, method_name):
+    p, r = precision_recall(res)
+
+    logger.info("=============================")
+    logger.info("Report for {}".format(method_name))
+    logger.info("Precision: {}".format(p))
+    logger.info("Recall: {}".format(r))
+    logger.info("=============================")
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description='Benchmark feature matching algorithms')
+    parser.add_argument('--dataset', help='path to the dataset to be processed')
+
+    args = parser.parse_args()
+
+    datasets = [args.dataset] if args.dataset else \
+        [
+            "data/benchmark_matching_run/amsterdam",
+            "data/benchmark_matching_run/copenhagen",
+            "data/benchmark_matching_run/lemans",
+            "data/benchmark_matching_run/malmo",
+            "data/benchmark_matching_run/malmohus",
+            "data/benchmark_matching_run/molleberga",
+            "data/benchmark_matching_run/portland",
+            "data/benchmark_matching_run/stapeln",
+        ]
+
+    default_config = {
+        'feature_process_size': 2048,
+        'feature_use_adaptive_suppression': False,
+        'lowes_ratio': 0.8,
+        'save_initial_matches': True,
+        'processes': 1,
+    }
+
+    matrix_config = merge_dicts(default_config, { "matcher_type": "MATRIX" })
+    flann_config = merge_dicts(default_config, { "matcher_type": "FLANN" })
+    words_sym_config = merge_dicts(default_config, { "matcher_type": "WORDS_SYMMETRIC" })
+    words_config = merge_dicts(default_config, { "matcher_type": "WORDS" })
+    cascade_config = merge_dicts(default_config, { "matcher_type": "CASCADE_HASHING" })
+
+    b_matches = {}
+    for d in datasets:
+        args.dataset = d
+        overwrite_config({ }, d)
+
+        commands.extract_metadata.Command().run(args)
+        commands.detect_features.Command().run(args)
+
+        bench_dir = create_bench_dir(d)
+        b_data = create_dataset(d, bench_dir, matrix_config)
+        match(b_data)
+        b_matches[d] = load_matches(b_data)
+
+    run_configs = [
+        merge_dicts(flann_config, { "flann_iterations": 10, "flann_branching": 8, "flann_checks": 20 }),
+        merge_dicts(flann_config, { "flann_iterations": 10, "flann_branching": 8, "flann_checks": 10 }),
+        merge_dicts(words_config, { "bow_num_checks": 20 }),
+        merge_dicts(words_sym_config, { "bow_num_checks": 20 }),
+        matrix_config,
+    ]
+
+    bench_results =  []
+    for c in run_configs:
+        bench_result = {
+            "config": c,
+            "datasets": [],
+            "matching_times": [],
+            "matching_times_pair": [],
+            "precisions": [],
+            "recalls": []
+        }
+
+        for d in datasets:
+            bench_dir = create_bench_dir(d)
+            t_data = create_dataset(d, bench_dir, c)
+
+            feature_loader.instance.clear_cache()
+
+            t, tp, p, r = match_and_report(t_data, b_matches[d])
+
+            bench_result["datasets"].append(d)
+            bench_result["matching_times"].append(str(t))
+            bench_result["matching_times_pair"].append(str(tp))
+            bench_result["precisions"].append(str(p))
+            bench_result["recalls"].append(str(r))
+
+        bench_results.append(bench_result)
+
+    for br in bench_results:
+        logger.info("========================================")
+        run_definition = "Report - "
+        for key, value in br["config"].items():
+            run_definition += key + ": " + str(value) + ", "
+
+        logger.info(run_definition)
+        logger.info("Dataset:")
+        logger.info("\t".join(br["datasets"]))
+        logger.info("Matching time:")
+        logger.info("\t".join(br["matching_times"]))
+        logger.info("Matching time pair:")
+        logger.info("\t".join(br["matching_times_pair"]))
+        logger.info("Precision:")
+        logger.info("\t".join(br["precisions"]))
+        logger.info("Recall:")
+        logger.info("\t".join(br["recalls"]))
+        logger.info("========================================")

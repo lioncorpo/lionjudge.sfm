@@ -1,0 +1,311 @@
+#!/usr/bin/env python
+
+import argparse
+import datetime
+import logging
+import math
+import numpy as np
+import networkx as nx
+import os.path
+import shutil
+import yaml
+
+
+from opensfm import bow
+from opensfm import commands
+from opensfm import dataset
+from opensfm import feature_loading
+from opensfm import io
+from opensfm import log
+from opensfm import matching
+from opensfm import pairs_selection
+
+
+logger = logging.getLogger(__name__)
+log.setup()
+
+
+def create_bench_dir(dataset):
+    base_dir = os.path.dirname(os.path.normpath(dataset)) if \
+        os.path.isdir(dataset) else \
+        os.path.dirname(dataset)
+
+    dataset_dir = os.path.basename(os.path.normpath(dataset))
+
+    bench_dir = os.path.join(
+        base_dir,
+        dataset_dir + \
+        '__bench_feat_match__' + \
+        datetime.datetime.now().strftime('%Y-%m-%d_%H-%M-%S'))
+
+    io.mkdir_p(bench_dir)
+
+    return bench_dir
+
+
+def create_dataset(orig_dir, bench_dir, config):
+    if config['image_retrieval'] == 'WORDS':
+        return create_words_dataset(orig_dir, bench_dir, config)
+    elif config['image_retrieval'] == 'VLAD':
+        return create_vlad_dataset(orig_dir, bench_dir, config)
+    else:
+        raise ValueError('Invalid image retreival type: {}'.format(
+            matcher_type))
+
+
+def create_words_dataset(orig_dir, bench_dir, config):
+    work_dir = os.path.join(bench_dir, 'words')
+    shutil.copytree(orig_dir, work_dir)
+
+    overwrite_config(config, work_dir)
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument('dataset')
+    args = parser.parse_args([work_dir])
+
+    data = dataset.DataSet(args.dataset)
+
+    for image in data.images():
+        bows = bow.load_bows(data.config)
+        n_closest = data.config['bow_words_to_match']
+        p, f, c = data.load_features(image)
+        closest_words = bows.map_to_words(
+            f, n_closest, data.config['bow_matcher_type'])
+        data.save_words(image, closest_words)
+
+    return data
+
+
+def create_vlad_dataset(orig_dir, bench_dir, config):
+    work_dir = os.path.join(bench_dir, 'vlad')
+    shutil.copytree(orig_dir, work_dir)
+
+    overwrite_config(config, work_dir)
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument('dataset')
+    args = parser.parse_args([work_dir])
+
+    return dataset.DataSet(args.dataset)
+
+
+def load_config(work_dir):
+    config = {}
+    filepath = os.path.join(work_dir, 'config.yaml')
+    if os.path.isfile(filepath):
+        with open(filepath) as fin:
+            new_config = yaml.safe_load(fin)
+        if new_config:
+            for k, v in new_config.items():
+                config[k] = v
+
+    return config
+
+
+def save_config(config, work_dir):
+    with open(os.path.join(work_dir, 'config.yaml'), 'w') as fout:
+        yaml.dump(config, fout, default_flow_style=False)
+
+
+def overwrite_config(config, work_dir):
+    orig_config = load_config(work_dir)
+
+    for key, value in config.items():
+        orig_config[key] = value
+
+    save_config(orig_config, work_dir)
+
+
+def merge_dicts(x, y):
+    z = x.copy()
+    z.update(y)
+    return z
+
+
+def match_ratio(matches, bench_matches, data):
+    total = 0
+    hits = 0
+
+    sequences = {}
+    for im in data.images():
+        e = data.load_exif(im)
+        sequences[im] = e['skey'] if 'skey' in e else im
+
+    non_sequence_count = 0
+    for im1 in data.images():
+        for im2 in data.images():
+            if im2 == im1:
+                continue
+
+            if sequences[im2] == sequences[im1]:
+                continue
+
+            non_sequence_count += 1
+
+    for im in bench_matches:
+        bm = [bim for bim in bench_matches[im] if sequences[bim] != sequences[im]]
+        cm = [cim for cim in matches[im] if sequences[cim] != sequences[im]]
+
+        im_total = len(bm)
+        im_hits = 0
+        for bim in bm:
+            if bim in cm[:im_total]:
+                im_hits += 1
+
+        total += im_total
+        hits += im_hits
+
+    ratio = float(hits) / total if total > 0 else 0
+    robust_ratio = float(total) / non_sequence_count
+    average_matchable = non_sequence_count / len(data.images())
+
+    return ratio, robust_ratio, average_matchable
+
+
+def bow_retrieval_ratio(data, bench_matches):
+    images = data.images()
+    histograms = pairs_selection.load_histograms(data, images)
+
+    matches = {}
+    for im in images:
+        _, order, other = pairs_selection.bow_distances(im, images, histograms)
+        matches[im] = np.array(other)[order].tolist()
+
+    return match_ratio(matches, bench_matches, data)
+
+
+def vlad_retrieval_ratio(data, bench_matches):
+    ims = data.images()
+    histograms = pairs_selection.vlad_histograms(ims, data, data.config['vlad_count'])
+
+    matches = {}
+    for im in ims:
+        _, order, other = pairs_selection.vlad_distances(im, ims, histograms)
+        matches[im] = np.array(other)[order].tolist()
+
+    return match_ratio(matches, bench_matches, data)
+
+
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser(description='Benchmark a reconstruction (exif data must exist)')
+    parser.add_argument('--dataset', help='path to the dataset to be processed')
+
+    args = parser.parse_args()
+
+    datasets = [args.dataset] if args.dataset else \
+        [
+            'data/benchmark_matching_run/amsterdam',
+            'data/benchmark_matching_run/copenhagen',
+            'data/benchmark_matching_run/lemans',
+            'data/benchmark_matching_run/malmo',
+            'data/benchmark_matching_run/malmohus',
+            'data/benchmark_matching_run/molleberga',
+            'data/benchmark_matching_run/portland',
+            'data/benchmark_matching_run/stapeln',
+        ]
+
+    default_config = {
+        'feature_type': 'HAHOG',
+        'feature_root': 1,
+        'feature_min_frames': 4000,
+        'feature_process_size': 2048,
+        'feature_use_adaptive_suppression': False,
+        'matching_gps_distance': 0,
+        'matching_gps_neighbors': 0,
+        'matching_time_neighbors': 0,
+        'matching_order_neighbors': 0,
+        'matching_bow_neighbors': 0,
+    }
+
+    configs = [
+        merge_dicts(default_config, { 'image_retrieval': 'VLAD', 'vlad_count': 64 }),
+    ]
+
+    b_matches = {}
+    feature_loader = feature_loading.FeatureLoader()
+
+    for index, d in enumerate(datasets):
+        b_matches[d] = {}
+
+        args.dataset = d
+        overwrite_config(merge_dicts(default_config, { 'matcher_type': 'MATRIX' }), d)
+
+        commands.detect_features.Command().run(args)
+        commands.match_features.Command().run(args)
+
+        bd = dataset.DataSet(args.dataset)
+
+        ims = bd.images()
+        matches_graph = nx.Graph()
+        for im in ims:
+            matches_graph.add_node(im)
+
+        for im1 in ims:
+            matches = bd.load_matches(im1)
+            for im2 in matches:
+                matches_graph.add_edge(im1, im2, { 'n': len(matches[im2]) })
+
+        for im1 in ims:
+            im1_matches = []
+            for im2 in ims:
+                if im1 == im2:
+                    continue
+
+                n_matches = matches_graph.get_edge_data(im1, im2)['n']
+                if n_matches > bd.config['robust_matching_min_match']:
+                    im1_matches.append([im2, n_matches])
+
+            im1_matches = sorted(im1_matches, key=lambda m: m[1], reverse=True)
+            b_matches[d][im1] = [i[0] for i in im1_matches]
+
+        logger.info('Matched dataset {} ({} / {})'.format(d, index + 1, len(datasets)))
+
+    bench_results =  []
+    for c in configs:
+        bench_result = {
+            'config': c,
+            'datasets': [],
+            'ratios': [],
+            'robust_ratios': [],
+            'average_matchables': [],
+        }
+
+        for index, d in enumerate(datasets):
+            bench_dir = create_bench_dir(d)
+            td = create_dataset(d, bench_dir, c)
+
+            if c['image_retrieval'] == 'WORDS':
+                ratio, robust_ratio, average_matchable = bow_retrieval_ratio(td, b_matches[d])
+            elif c['image_retrieval'] == 'VLAD':
+                ratio, robust_ratio, average_matchable = vlad_retrieval_ratio(td, b_matches[d])
+            else:
+                raise ValueError('Invalid image retreival type: {}'.format(
+                    matcher_type))
+
+            bench_result['datasets'].append(d)
+            bench_result['ratios'].append(str(ratio))
+            bench_result['robust_ratios'].append(str(robust_ratio))
+            bench_result['average_matchables'].append(str(average_matchable))
+
+            logger.info('Benched dataset {} ({} / {})'.format(d, index + 1, len(datasets)))
+
+        bench_results.append(bench_result)
+
+    for br in bench_results:
+        logger.info('========================================')
+        run_definition = 'Report: '
+        for key, value in br['config'].items():
+            run_definition += key + ': ' + str(value) + ',' if 'matching' not in key else ''
+
+        run_definition = run_definition[:-1]
+
+        logger.info(run_definition)
+        logger.info('Dataset:')
+        logger.info('\t'.join(br['datasets']))
+        logger.info('Ratio:')
+        logger.info('\t'.join(br['ratios']))
+        logger.info('Robust ratio:')
+        logger.info('\t'.join(br['robust_ratios']))
+        logger.info('Average matchable per image:')
+        logger.info('\t'.join(br['average_matchables']))
+        logger.info('========================================')
