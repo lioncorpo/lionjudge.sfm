@@ -1,0 +1,26 @@
+#!/usr/bin/env bash
+
+set -e
+
+DIR=$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )
+PYTHON=${2:-python}
+
+echo "Running using Python command: $PYTHON"
+
+#pre-processing similar to opensfm
+# $PYTHON $DIR/opensfm extract_metadata $1
+# $PYTHON $DIR/opensfm detect_features $1
+
+
+# $PYTHON $DIR/opensfm extract_metadata $1
+SLAM_DIR="/home/fschenk/software/mapillary_repos/OpenSfM/"
+# $PYTHON $DIR/openslam openslam $1
+echo $PYTHON $SLAM_DIR/openslam/run_openslam.py $1
+$PYTHON $SLAM_DIR/openslam/run_openslam.py $1 #openslam $1
+# $PYTHON $DIR/opensfm detect_features $1
+# $PYTHON $DIR/opensfm match_features $1
+# $PYTHON $DIR/opensfm create_tracks $1
+# $PYTHON $DIR/opensfm reconstruct $1
+# $PYTHON $DIR/opensfm mesh $1
+# $PYTHON $DIR/opensfm undistort $1
+# $PYTHON $DIR/opensfm compute_depthmaps $1
